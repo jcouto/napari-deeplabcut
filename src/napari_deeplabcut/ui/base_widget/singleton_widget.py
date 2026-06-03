@@ -123,15 +123,16 @@ class ViewerSingletonWidget(QWidget, OwnedTimersMixin):
 
     def _singleton_prepare_init(self, *args, **kwargs) -> bool:
         """Pre-Qt-init guard. Safe to call before QWidget.__init__()."""
-        if getattr(self, "_viewer_singleton_initialized", False):
+        # Use __dict__ directly to avoid PyQt's RuntimeError on uninitialized QWidget
+        if self.__dict__.get("_viewer_singleton_initialized", False):
             return False
 
         viewer = self._extract_viewer_from_call(args, kwargs)
         if viewer is None:
             raise TypeError(f"{self.__class__.__name__} requires a viewer argument during initialization.")
 
-        self._viewer_singleton_initialized = True
-        self._viewer_singleton_key = self.canonical_viewer(viewer)
+        self.__dict__["_viewer_singleton_initialized"] = True
+        self.__dict__["_viewer_singleton_key"] = self.canonical_viewer(viewer)
         return True
 
     def _singleton_finalize_init(self) -> None:
