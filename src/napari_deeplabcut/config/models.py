@@ -333,6 +333,16 @@ class DLCHeaderModel(BaseModel):
         # stable unique preserving first seen order
         return list(dict.fromkeys(pairs))
 
+    @staticmethod
+    def _find_duplicates(values: list[str]):
+        seen = set()
+        dupl = []
+        for v in values:
+            if v in seen and v not in dupl:
+                dupl.append(v)
+            seen.add(v)
+        return dupl
+
     @classmethod
     def from_config(cls, config: dict) -> DLCHeaderModel:
         """
@@ -348,6 +358,25 @@ class DLCHeaderModel(BaseModel):
         if multi:
             inds = [str(x) for x in config["individuals"]]
             bps = [str(x) for x in config["multianimalbodyparts"]]
+            unique_bps = [str(x) for x in config.get("uniquebodyparts", [])]
+
+            dup_inds = DLCHeaderModel._find_duplicates(inds)
+            dup_bps = DLCHeaderModel._find_duplicates(bps)
+            dup_unique = DLCHeaderModel._find_duplicates(unique_bps)
+
+            if dup_inds:
+                raise ValueError(f"Duplicate individuals in config.yaml: {dup_inds}")
+            if dup_bps:
+                raise ValueError(f"Duplicate multianimalbodyparts in config.yaml: {dup_bps}")
+            if dup_unique:
+                raise ValueError(f"Duplicate uniquebodyparts in config.yaml: {dup_unique}")
+
+            if "single" in inds and set(bps) & set(unique_bps):
+                raise ValueError(
+                    "Invalid config.yaml: 'single' individual conflicts with uniquebodyparts. "
+                    "Do not use 'single' as an individual name if you have uniquebodyparts."
+                )
+
             coords = ["x", "y"]
             for i in inds:
                 for bp in bps:
@@ -360,6 +389,9 @@ class DLCHeaderModel(BaseModel):
             names = ["scorer", "individuals", "bodyparts", "coords"]
         else:
             bps = [str(x) for x in config["bodyparts"]]
+            dup_bps = DLCHeaderModel._find_duplicates(bps)
+            if dup_bps:
+                raise ValueError(f"Duplicate bodyparts in config.yaml: {dup_bps}")
             coords = ["x", "y"]
             for bp in bps:
                 for c in coords:
@@ -553,6 +585,7 @@ class PointsMetadata(BaseModel):
 class ConflictEntry:
     frame_label: str
     keypoints: tuple[str, ...]
+    deleted_keypoints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -580,6 +613,7 @@ class OverwriteConflictReport:
     """
 
     n_overwrites: int
+    n_deletions: int
     n_frames: int
     entries: tuple[ConflictEntry, ...]
     truncated_entries: int = 0
@@ -588,17 +622,41 @@ class OverwriteConflictReport:
 
     @property
     def has_conflicts(self) -> bool:
-        return self.n_overwrites > 0
+        return self.n_overwrites > 0 or self.n_deletions > 0
 
     @property
     def details_text(self) -> str:
+        """
+        Build plain-text conflict details for the scrollable details box.
+
+        Expected report entry fields:
+        - frame_label
+        - keypoints: modified/overwritten keypoints
+        - deleted_keypoints: cleared/deleted keypoints
+        """
         if not self.entries:
             return "No detailed conflicts."
-        lines = [f"{entry.frame_label} → {', '.join(entry.keypoints)}" for entry in self.entries]
-        if self.truncated_entries:
+
+        lines: list[str] = []
+
+        for entry in self.entries:
+            lines.append(str(entry.frame_label))
+
+            modified = tuple(getattr(entry, "keypoints", ()) or ())
+            deleted = tuple(getattr(entry, "deleted_keypoints", ()) or ())
+
+            if modified:
+                lines.append(f"  Modified: {', '.join(modified)}")
+
+            if deleted:
+                lines.append(f"  Deleted / cleared: {', '.join(deleted)}")
+
             lines.append("")
+
+        if self.truncated_entries:
             lines.append(f"… and {self.truncated_entries} more frame/image entries.")
-        return "\n".join(lines)
+
+        return "\n".join(lines).rstrip()
 
 
 # -----------------------------------------------------------------------------

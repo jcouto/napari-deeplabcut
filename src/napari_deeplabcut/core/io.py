@@ -53,11 +53,12 @@ from napari_deeplabcut.config.settings import (
 from napari_deeplabcut.config.supported_files import SUPPORTED_IMAGES, SUPPORTED_VIDEOS
 from napari_deeplabcut.core import schemas as dlc_schemas
 from napari_deeplabcut.core.dataframes import (
+    complete_df_for_save,
+    drop_likelihood_columns,
     form_df_from_validated,
     guarantee_multiindex_rows,
-    harmonize_keypoint_column_index,
-    harmonize_keypoint_row_index,
     merge_multiple_scorers,
+    merge_save_df,
     restore_dlc_on_disk_header_shape,
     set_df_scorer,
 )
@@ -340,22 +341,6 @@ def form_df(
     return df
 
 
-def _drop_likelihood_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove DLC likelihood columns from a dataframe if present."""
-    # DLC-style wide dataframe: MultiIndex columns with a coords level
-    if isinstance(df.columns, pd.MultiIndex):
-        col_names = list(df.columns.names)
-        if "coords" in col_names:
-            mask = df.columns.get_level_values("coords").astype(str) != "likelihood"
-            return df.loc[:, mask]
-
-    # Fallback for already-stacked / flat dataframes
-    if "likelihood" in df.columns:
-        return df.drop(columns="likelihood")
-
-    return df
-
-
 def _drop_likelihood_from_header(header: DLCHeaderModel) -> DLCHeaderModel:
     """
     Return, "names": names})    Return a header model with likelihood removed from the coords level,
@@ -420,11 +405,19 @@ def _resolve_multianimalproject_for_write(
 def _atomic_to_hdf(df: pd.DataFrame, out_path: Path, key: str = DLC_CANONICAL_H5_KEY) -> None:
     """Best-effort atomic write: write to temp and replace."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    # Write temp
-    df.to_hdf(tmp, key=key, mode="w")
-    # Replace
-    tmp.replace(out_path)
+
+    tmp = out_path.parent / f".{out_path.stem}.tmp{out_path.suffix}"
+
+    try:
+        df.to_hdf(tmp, key=key, mode="w")
+        tmp.replace(out_path)
+    except Exception:
+        logger.exception("Failed atomic HDF write tmp=%s out=%s", tmp, out_path)
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            logger.debug("Failed to remove temporary HDF file %s", tmp, exc_info=True)
+        raise
 
 
 def write_hdf(path: str, data, attributes: dict) -> list[str]:
@@ -465,7 +458,7 @@ def write_hdf(path: str, data, attributes: dict) -> list[str]:
     logger.debug("WRITE header bodyparts=%s", ctx.meta.header.bodyparts)
     logger.debug("WRITE props labels unique=%s", list(dict.fromkeys(map(str, attrs.properties.get("label", []))))[:30])
     df_new = form_df_from_validated(ctx)
-    df_new = _drop_likelihood_columns(df_new)
+    df_new = drop_likelihood_columns(df_new)
 
     logger.debug("DF_NEW columns nlevels: %s", df_new.columns.nlevels)
     logger.debug("DF_NEW columns names: %s", df_new.columns.names)
@@ -485,6 +478,8 @@ def write_hdf(path: str, data, attributes: dict) -> list[str]:
         df_new = set_df_scorer(df_new, target_scorer)
     header_for_write = pts_meta.header.with_scorer(target_scorer) if target_scorer else pts_meta.header
     header_for_write = _drop_likelihood_from_header(header_for_write)
+
+    df_new = complete_df_for_save(df_new, pts_meta=pts_meta, header=header_for_write)
 
     # Never write back to machine sources without an explicit promotion target
     if not out_path and source_kind == AnnotationKind.MACHINE:
@@ -540,7 +535,7 @@ def write_hdf(path: str, data, attributes: dict) -> list[str]:
 
     # Merge-on-save for GT
     if destination_kind == AnnotationKind.GT and out.exists():
-        df_old = _drop_likelihood_columns(_read_hdf_any_key(out))
+        df_old = drop_likelihood_columns(_read_hdf_any_key(out))
 
         # Harmonize indices and merge
         try:
@@ -554,10 +549,7 @@ def write_hdf(path: str, data, attributes: dict) -> list[str]:
             )
             pass
 
-        df_new, df_old = harmonize_keypoint_row_index(df_new, df_old)
-        df_new = harmonize_keypoint_column_index(df_new)
-        df_old = harmonize_keypoint_column_index(df_old)
-        df_out = df_new.combine_first(df_old)
+        df_out = merge_save_df(df_old, df_new)
     else:
         df_out = df_new
 
@@ -574,7 +566,7 @@ def write_hdf(path: str, data, attributes: dict) -> list[str]:
         pts_meta=pts_meta,
     )
     df_out = restore_dlc_on_disk_header_shape(df_out, header_for_write, is_ma_project=is_ma_project)
-    df_out = _drop_likelihood_columns(df_out)
+    df_out = drop_likelihood_columns(df_out)
 
     logger.debug("FINAL WRITE first columns=%s", list(df_out.columns[:10]))
     logger.debug(
@@ -592,12 +584,33 @@ def write_hdf(path: str, data, attributes: dict) -> list[str]:
             list(dict.fromkeys(df_out.columns.get_level_values("individuals").astype(str))),
         )
 
-    # Write .h5 and .csv
-    _atomic_to_hdf(df_out, out, key=DLC_CANONICAL_H5_KEY)
-    csv_path = out.with_suffix(".csv")
-    df_out.to_csv(csv_path)
+    cols = df_out.columns
+    logger.debug("FINAL WRITE columns count=%d unique_count=%d", len(cols), len(cols.unique()))
 
-    return [str(out), str(csv_path)]
+    if cols.has_duplicates:
+        dup = cols[cols.duplicated(keep=False)]
+        logger.error(
+            "FINAL WRITE duplicate columns sample=%s",
+            list(dict.fromkeys(map(str, dup)))[:50],
+        )
+        raise ValueError(f"Duplicate columns detected in output DataFrame: {list(dict.fromkeys(map(str, dup)))}")
+
+    # Write .h5 and .csv
+    try:
+        logger.debug("Writing HDF to %s", out)
+        _atomic_to_hdf(df_out, out, key=DLC_CANONICAL_H5_KEY)
+
+        csv_path = out.with_suffix(".csv")
+        logger.debug("Writing CSV to %s", csv_path)
+        df_out.to_csv(csv_path)
+
+        written = [str(out), str(csv_path)]
+        logger.debug("write_hdf returning %r exists=%r", written, [(p, Path(p).exists()) for p in written])
+        return written
+
+    except Exception:
+        logger.exception("write_hdf failed during final disk write")
+        raise
 
 
 # =============================================================================
